@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-import json, os, re, signal, subprocess, sys
+import json, os, re, shutil, signal, subprocess, sys
 from http.server import HTTPServer, BaseHTTPRequestHandler
 
 
@@ -138,14 +138,15 @@ setInterval(load,5000);
 
 
 def adb(*args, timeout=15):
-    cmd = ['adb'] + list(args)
+    adb_bin = 'adb' if shutil.which('adb') else os.path.expanduser('~/android-sdk/platform-tools/adb')
+    cmd = [adb_bin] + list(args)
     try:
         r = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
         if r.returncode != 0:
             raise RuntimeError(r.stderr.strip() or f'exit code {r.returncode}')
         return r.stdout
     except FileNotFoundError:
-        raise RuntimeError('adb no encontrado en PATH')
+        raise RuntimeError('adb no encontrado. Instalalo o agregalo al PATH.')
 
 
 def get_foreground_app():
