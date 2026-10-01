@@ -4,9 +4,9 @@ Type=Application
 Name=App Killer
 GenericName=Android App Uninstaller
 Comment=Elimina apps de Android desde el navegador con un clic
-Exec=bash -c 'export PATH="$HOME/android-sdk/platform-tools:$PATH"; python3 /home/jholguin/app-killer/app_manager.py & PID=$!; sleep 2; xdg-open http://localhost:8080; wait $PID || { echo; read -sp "Presiona Enter para cerrar..."; }'
+Exec=/home/jholguin/app-killer/run.sh
 Icon=system-software-install
-Terminal=true
+Terminal=false
 StartupNotify=true
 Categories=Utility;Development;
 Keywords=android;adb;uninstall;app;desinstalar;

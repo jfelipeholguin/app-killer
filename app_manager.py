@@ -1,13 +1,32 @@
 #!/usr/bin/env python3
-import json, os, re, shutil, signal, subprocess, sys
-from http.server import HTTPServer, BaseHTTPRequestHandler
+import glob, json, os, re, shutil, signal, subprocess, sys, threading, time
+from http.server import ThreadingHTTPServer, BaseHTTPRequestHandler
 
 
 def html_escape(text):
     return text.replace('&', '&amp;').replace('<', '&lt;').replace('>', '&gt;').replace('"', '&quot;').replace("'", '&#39;')
 
 
-PORT = 8080
+PORT = 8085
+
+# El puerto solo escucha en loopback, pero cualquier pagina web que visites en el
+# navegador puede intentar llamar a la API local. Solo aceptamos peticiones que
+# vengan del propio servidor.
+ALLOWED_ORIGINS = {f'http://127.0.0.1:{PORT}', f'http://localhost:{PORT}'}
+ALLOWED_HOSTS = {'127.0.0.1', 'localhost'}
+
+# Cache: detectar la app en primer plano cuesta varios 'adb shell dumpsys', pero la
+# UI refresca cada 5s. Servimos la misma respuesta durante FG_CACHE_TTL segundos.
+FG_CACHE_TTL = 2.0
+_fg_lock = threading.Lock()
+_fg_cache = {'ts': 0.0, 'pkg': None, 'err': None}
+
+# Cache de metadatos por paquete (nombre y version no cambian en caliente).
+_info_cache = {}
+_info_lock = threading.Lock()
+
+# Los APK se descargan una sola vez y se reutilizan entre reinicios.
+APK_CACHE_DIR = os.path.expanduser('~/.cache/app-killer/apks')
 
 HTML = r"""<!DOCTYPE html>
 <html lang="es">
@@ -151,7 +170,17 @@ def adb(*args, timeout=15):
 
 def get_foreground_app():
     """Get the currently foreground app from the device."""
-    # Method 1: dumpsys window (works on most devices)
+    devices_out = adb('devices', timeout=5)
+    dev_lines = [l.strip() for l in devices_out.strip().split('\n')[1:] if l.strip()]
+    if not dev_lines:
+        raise RuntimeError('No hay ningún celular conectado vía ADB. Verifica que el cable esté conectado y que la "Depuración USB" esté activada en tu teléfono.')
+    if any('unauthorized' in l for l in dev_lines):
+        raise RuntimeError('Dispositivo no autorizado. Mira la pantalla de tu celular y acepta el mensaje de "¿Permitir depuración USB?".')
+    if not any('\tdevice' in l for l in dev_lines):
+        raise RuntimeError('El dispositivo aún no está listo: ' + dev_lines[0])
+
+    # Method 1: dumpsys window (solo funciona en Android < 10; en Android 10+ este
+    # comando ya no devuelve mCurrentFocus, y el metodo 2 queda como unico camino)
     try:
         out = adb('shell', 'dumpsys', 'window', 'windows', timeout=10)
         for line in out.split('\n'):
@@ -165,11 +194,12 @@ def get_foreground_app():
     except RuntimeError:
         pass
 
-    # Method 2: dumpsys activity
+    # Method 2: dumpsys activity. En Android 10+ el campo autoritativo es
+    # 'topResumedActivity'; 'ResumedActivity' cubre versiones anteriores.
     try:
         out = adb('shell', 'dumpsys', 'activity', 'activities', timeout=10)
         for line in out.split('\n'):
-            if 'ResumedActivity:' in line or 'mFocusedApp=' in line:
+            if 'topResumedActivity' in line or 'ResumedActivity:' in line or 'mFocusedApp=' in line:
                 m = re.search(r'([a-zA-Z][\w.]+\.[\w.]+)/', line)
                 if m:
                     pkg = m.group(1)
@@ -179,6 +209,26 @@ def get_foreground_app():
         pass
 
     raise RuntimeError('No se detectó ninguna app en primer plano. Abrí una app en tu teléfono.')
+
+
+def get_foreground_app_cached():
+    """Igual que get_foreground_app, pero reutiliza el resultado durante FG_CACHE_TTL.
+
+    El lock se mantiene durante la lectura para que varias peticiones simultaneas
+    no lancen cada una su propia tanda de 'adb shell dumpsys'.
+    """
+    with _fg_lock:
+        if _fg_cache['pkg'] is not None and (time.monotonic() - _fg_cache['ts']) < FG_CACHE_TTL:
+            return _fg_cache['pkg']
+        try:
+            pkg = get_foreground_app()
+            err = None
+        except RuntimeError as e:
+            pkg, err = None, str(e)
+        _fg_cache.update(ts=time.monotonic(), pkg=pkg, err=err)
+        if pkg is None:
+            raise RuntimeError(err)
+        return pkg
 
 
 _SYSTEM_PACKAGES = None
@@ -199,8 +249,64 @@ def _load_system_packages():
     return _SYSTEM_PACKAGES
 
 
+def _aapt2_bin():
+    """Localiza aapt2: primero en el PATH, y si no en el SDK de Android."""
+    found = shutil.which('aapt2')
+    if found:
+        return found
+    candidates = sorted(glob.glob(os.path.expanduser('~/android-sdk/build-tools/*/aapt2')))
+    return candidates[-1] if candidates else None
+
+
+def resolve_app_label(pkg):
+    """Devuelve el nombre real de la app (el que se ve en el launcher).
+
+    Android 10+ ya no expone 'label=' en 'dumpsys package' (solo un labelRes
+    numérico), asi que hay que leerlo del APK con aapt2.
+    """
+    aapt2 = _aapt2_bin()
+    if not aapt2:
+        return None
+    try:
+        out = adb('shell', 'pm', 'path', pkg, timeout=10)
+    except RuntimeError:
+        return None
+
+    remotes = [l.strip()[len('package:'):] for l in out.split('\n') if l.strip().startswith('package:')]
+    if not remotes:
+        return None
+
+    try:
+        os.makedirs(APK_CACHE_DIR, exist_ok=True)
+    except OSError:
+        return None
+
+    for remote in remotes:
+        safe = pkg.replace('/', '_')
+        local = os.path.join(APK_CACHE_DIR, f'{safe}.apk')
+        try:
+            if not os.path.exists(local):
+                # 'adb pull' escribe el progreso en stderr y devuelve 0 al terminar.
+                adb('pull', remote, local, timeout=120)
+            if not os.path.exists(local):
+                continue
+            r = subprocess.run([aapt2, 'dump', 'badging', local],
+                               capture_output=True, text=True, timeout=60)
+            m = re.search(r"^application-label:'([^']*)'", r.stdout, re.M)
+            if m and m.group(1).strip():
+                return m.group(1).strip()
+        except (RuntimeError, subprocess.SubprocessError, OSError):
+            continue
+    return None
+
+
 def get_app_info(pkg):
     """Get version, label and system/user status for a package."""
+    with _info_lock:
+        cached = _info_cache.get(pkg)
+    if cached is not None:
+        return cached
+
     info = {'packageName': pkg, 'appName': html_escape(pkg), 'version': None,
             'isSystem': pkg in _load_system_packages()}
     try:
@@ -208,11 +314,15 @@ def get_app_info(pkg):
         vm = re.search(r'versionName=(\S+)', out)
         if vm:
             info['version'] = vm.group(1).strip()
-        lm = re.search(r'ApplicationInfo\{[^}]*?\blabel=([^\s,}]+)', out)
-        if lm:
-            info['appName'] = html_escape(lm.group(1))
     except RuntimeError:
         pass
+
+    label = resolve_app_label(pkg)
+    if label:
+        info['appName'] = html_escape(label)
+
+    with _info_lock:
+        _info_cache[pkg] = info
     return info
 
 
@@ -233,34 +343,58 @@ def uninstall_pkg(pkg, is_system):
 
 
 class Handler(BaseHTTPRequestHandler):
+    def reject_cross_origin(self):
+        """Impide que otra web use esta API local.
+
+        El servidor escucha solo en loopback, pero cualquier pagina abierta en el
+        navegador puede intentar pegarle a http://127.0.0.1:8085. Sin esto, visitar
+        una web seria suficiente para que desinstale apps de tu telefono.
+        Devuelve True si la peticion fue rechazada.
+        """
+        host = (self.headers.get('Host') or '').strip()
+        if host.split(':')[0] not in ALLOWED_HOSTS:
+            self.json({'error': 'Host no permitido'}, status=403)
+            return True
+        origin = self.headers.get('Origin')
+        if origin and origin not in ALLOWED_ORIGINS:
+            self.json({'error': 'Origen no permitido'}, status=403)
+            return True
+        return False
+
     def do_OPTIONS(self):
         self.send_response(204)
-        self.send_header('Access-Control-Allow-Origin', '*')
-        self.send_header('Access-Control-Allow-Methods', 'GET, POST, OPTIONS')
-        self.send_header('Access-Control-Allow-Headers', 'Content-Type')
         self.end_headers()
 
     def do_POST(self):
-        if self.path == '/api/uninstall':
-            length = int(self.headers.get('Content-Length', 0))
-            data = json.loads(self.rfile.read(length))
-            pkg = data.get('packageName', '')
-            is_sys = data.get('isSystem', False)
-            ok, err = uninstall_pkg(pkg, is_sys)
-            self.json({'success': ok, 'error': err, 'packageName': pkg})
-        else:
+        if self.path != '/api/uninstall':
             self.send_response(404)
             self.end_headers()
+            return
+        if self.reject_cross_origin():
+            return
+        length = int(self.headers.get('Content-Length', 0))
+        try:
+            data = json.loads(self.rfile.read(length) or b'{}')
+        except json.JSONDecodeError:
+            self.json({'error': 'JSON inválido'}, status=400)
+            return
+        pkg = data.get('packageName', '')
+        if not re.fullmatch(r'[A-Za-z][\w.]*', pkg or ''):
+            self.json({'error': 'Nombre de paquete inválido'}, status=400)
+            return
+        ok, err = uninstall_pkg(pkg, bool(data.get('isSystem', False)))
+        self.json({'success': ok, 'error': err, 'packageName': pkg})
 
     def do_GET(self):
         if self.path == '/api/foreground':
+            if self.reject_cross_origin():
+                return
             try:
-                pkg = get_foreground_app()
-                info = get_app_info(pkg)
-                self.json(info)
+                pkg = get_foreground_app_cached()
+                self.json(get_app_info(pkg))
             except RuntimeError as e:
                 self.json({'error': str(e)})
-        elif self.path in ('/favicon.ico',):
+        elif self.path == '/favicon.ico':
             self.send_response(204)
             self.end_headers()
         else:
@@ -269,12 +403,13 @@ class Handler(BaseHTTPRequestHandler):
             self.end_headers()
             self.wfile.write(HTML.encode())
 
-    def json(self, data):
-        self.send_response(200)
+    def json(self, data, status=200):
+        body = json.dumps(data).encode()
+        self.send_response(status)
         self.send_header('Content-Type', 'application/json')
-        self.send_header('Access-Control-Allow-Origin', '*')
+        self.send_header('Content-Length', str(len(body)))
         self.end_headers()
-        self.wfile.write(json.dumps(data).encode())
+        self.wfile.write(body)
 
     def log_message(self, fmt, *args):
         if ' 400' in args[0] or ' 500' in args[0]:
@@ -283,24 +418,26 @@ class Handler(BaseHTTPRequestHandler):
 
 def main():
     try:
-        adb('get-state', timeout=5)
-    except RuntimeError as e:
-        print(' ADB:', e)
-        sys.exit(1)
+        devices = adb('devices', timeout=5)
+        connected = [l.split('\t') for l in devices.strip().split('\n')[1:] if '\tdevice' in l]
+        if not connected:
+            print(' [AVISO] No hay dispositivos ADB detectados todavía.')
+            print(' Asegurate de activar "Depuración USB" en tu teléfono.')
+        else:
+            print(f' Dispositivo detectado: {connected[0][0]}')
+    except Exception as e:
+        print(' [AVISO] ADB:', e)
 
-    devices = adb('devices', timeout=5)
-    connected = [l.split('\t') for l in devices.strip().split('\n')[1:] if '\tdevice' in l]
-    if not connected:
-        print(' No hay dispositivos conectados.')
-        sys.exit(1)
-
-    server = HTTPServer(('127.0.0.1', PORT), Handler)
+    server = ThreadingHTTPServer(('127.0.0.1', PORT), Handler)
     print(f' Abre http://localhost:{PORT} en tu navegador')
     print(' Abrí una app en tu teléfono y aparecerá en la web.')
 
     def shutdown(sig, frame):
         print('\n Deteniendo...')
-        server.shutdown()
+        # shutdown() bloquea hasta que serve_forever() termine, asi que no puede
+        # llamarse desde este handler: esta corriendo en el mismo hilo y se
+        # deadlockearia. Lo pedimos desde otro hilo y salimos de inmediato.
+        threading.Thread(target=server.shutdown, daemon=True).start()
         sys.exit(0)
 
     signal.signal(signal.SIGINT, shutdown)
